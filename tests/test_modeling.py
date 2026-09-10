@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from vesper.features import FEATURES
-from vesper.modeling import Ensemble
+from vesper.modeling import Ensemble, fit_calibration
 
 
 def test_model_artifact_roundtrip_and_tamper_detection(tmp_path):
@@ -30,3 +30,15 @@ def test_model_artifact_roundtrip_and_tamper_detection(tmp_path):
     path.write_text(path.read_text() + "\nchanged\n")
     with pytest.raises(ValueError, match="fingerprint"):
         Ensemble.load(directory)
+
+
+def test_calibration_requires_class_support_and_corrects_overconfidence():
+    frame = pd.DataFrame({"session": ["2024-01-02"]*1000,
+                          "target_return": np.linspace(-.1, .1, 1000), "spy_return": 0.})
+    for name in ("positive", "outperform", "top_decile", "top_five", "top_one"):
+        frame[f"p_{name}"] = .9
+    calibration = fit_calibration(frame)
+    from scipy.special import expit, logit
+    calibrated = expit(calibration["positive"]["slope"]*logit(.9)+calibration["positive"]["intercept"])
+    assert calibrated == pytest.approx(.5, abs=.02)
+    assert "top_one" not in calibration

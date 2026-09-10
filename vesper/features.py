@@ -27,6 +27,9 @@ def intraday(frame, cutoff, session_open):
     frame = frame[frame.end >= session_open]
     records = []
     for ticker, bars in frame.groupby("ticker", sort=False):
+        if bars.iloc[0].end >= pd.Timestamp(session_open) + pd.Timedelta(minutes=1):
+            # A stream started late cannot redefine the regular-session opening price.
+            continue
         if (bars[["open", "high", "low", "close", "vwap"]] <= 0).any().any():
             continue
         if (bars.volume < 0).any() or (bars.high < bars.low).any() or bars.volume.sum() <= 0:

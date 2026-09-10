@@ -45,9 +45,10 @@ def bars():
 def test_future_bar_and_late_arrival_excluded():
     frame = bars()
     cutoff = pd.Timestamp("2026-09-04T19:49:59.999999Z")
-    original = intraday(frame, cutoff, pd.Timestamp("2026-09-04T13:30Z"))
+    original = intraday(frame, cutoff, pd.Timestamp("2026-09-04T19:00Z"))
+    assert not original.empty
     frame.loc[frame.end > cutoff, "close"] = 900
-    assert original.equals(intraday(frame, cutoff, pd.Timestamp("2026-09-04T13:30Z")))
+    assert original.equals(intraday(frame, cutoff, pd.Timestamp("2026-09-04T19:00Z")))
     frame.loc[0, "available_at"] = cutoff + pd.Timedelta(seconds=1)
     assert len(cutoff_rows(frame, cutoff)) == 49
 

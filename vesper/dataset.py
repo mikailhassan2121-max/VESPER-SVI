@@ -1,11 +1,11 @@
 import json
-from collections import defaultdict, deque
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
 from vesper.calendar import Calendar
+from vesper.context import HistoricalContext, dated_records
 from vesper.features import build_features, normalize_bars
 from vesper.labels import labels
 
@@ -17,8 +17,7 @@ def build_dataset(directory, output):
     of delistings/mergers instead of teaching only from the surviving securities.
     """
     calendar = Calendar()
-    previous_daily = deque(maxlen=65)
-    profiles = defaultdict(lambda: deque(maxlen=20))
+    history = HistoricalContext()
     samples, unresolved = [], []
     folders = sorted((Path(directory) / "historical").glob("????-??-??"))
     for folder in folders:
@@ -26,7 +25,7 @@ def build_dataset(directory, output):
             raise ValueError(f"Incomplete acquisition: {folder.name}")
         session = calendar.session(date.fromisoformat(folder.name))
         universe = json.loads((folder / "universe.json").read_text())["eligible"]
-        minute_frames, targets, current_daily, volumes = [], {}, [], {}
+        minute_frames, targets, actions = [], {}, []
         for path in (folder / "minutes").glob("*.json"):
             payload = json.loads(path.read_text(encoding="utf-8"))
             ticker = payload["ticker"]
@@ -36,30 +35,21 @@ def build_dataset(directory, output):
                 continue
             current = bars[(bars.end >= session.open) & (bars.end < session.close)]
             minute_frames.append(current)
-            # Raw price history across a split must be normalized to the current share basis.
-            for action in payload["actions"].get("splits", []):
-                if action["execution_date"] == folder.name:
-                    ratio = action["split_to"] / action["split_from"]
-                    for daily_frame in previous_daily:
-                        mask = daily_frame.ticker == ticker
-                        daily_frame.loc[mask, ["open", "high", "low", "close", "vwap"]] /= ratio
-                        daily_frame.loc[mask, "volume"] *= ratio
-                    profiles[ticker] = deque([v * ratio for v in profiles[ticker]], maxlen=20)
+            actions.extend(payload["actions"].get("splits", []))
             try:
                 targets[ticker] = labels(bars, session, payload["actions"])
             except (ValueError, KeyError) as exc:
                 unresolved.append({"session": folder.name, "ticker": ticker, "reason": str(exc)})
-            if not current.empty:
-                current_daily.append({"ticker": ticker, "end": pd.Timestamp(session.close),
-                                      "available_at": pd.Timestamp(session.close) + pd.Timedelta(seconds=1),
-                                      "open": current.iloc[0].open, "close": current.iloc[-1].close,
-                                      "high": current.high.max(), "low": current.low.min(),
-                                      "volume": current.volume.sum(), "vwap": current.vwap.mean()})
-                volumes[ticker] = current[current.end <= session.cutoff].volume.sum()
-        if minute_frames and previous_daily:
-            expected = {t: sum(v) / len(v) for t, v in profiles.items() if len(v) >= 20}
-            features = build_features(pd.concat(minute_frames), pd.concat(previous_daily), expected,
-                                      session.cutoff, session.open)
+        if minute_frames:
+            daily, expected = history.inputs(session, session.cutoff, actions)
+            records = dated_records(Path(directory) / "context" / "sectors.json", session.cutoff)
+            sectors = {row["ticker"]: row["sector"] for row in records}
+            sector_returns = {}
+            for ticker, target in targets.items():
+                if ticker in sectors and ticker in universe:
+                    sector_returns.setdefault(sectors[ticker], []).append(target["target_return"])
+            features = build_features(pd.concat(minute_frames), daily, expected,
+                                      session.cutoff, session.open, sectors=sectors)
             if not features.empty and "SPY" in targets:
                 for row in features.to_dict("records"):
                     ticker = row["ticker"]
@@ -70,16 +60,16 @@ def build_dataset(directory, output):
                         continue
                     samples.append(row | targets[ticker] | {"session": folder.name, "cutoff": session.cutoff,
                         "feature_available_at": session.cutoff, "spy_return": targets["SPY"]["target_return"],
-                        "sector_return": float("nan"), "pit_universe": True, "source": "massive"})
-        if current_daily:
-            previous_daily.append(pd.DataFrame(current_daily))
-        for ticker, volume in volumes.items():
-            profiles[ticker].append(volume)
+                        "sector_return": (sum(sector_returns[sectors[ticker]]) / len(sector_returns[sectors[ticker]]))
+                            if ticker in sectors and sectors[ticker] in sector_returns else float("nan"),
+                        "sector_benchmark": "equal_weight_point_in_time_sector_peers",
+                        "pit_universe": True, "source": "massive"})
+            history.add(session, pd.concat(minute_frames, ignore_index=True))
     report_path = Path(output).with_suffix(".audit.json")
     audit = {"sessions": len(folders), "rows": len(samples), "unresolved": unresolved,
              "production_ready": False, "limitations": ["Historical revisions are not original publication snapshots",
                  "Point-in-time sector mappings required", "Historical NBBO costs use explicit conservative assumptions",
-                 "Historical news/catalyst coverage not integrated", "Early-close volume profiles require matched session lengths"]}
+                 "Historical news/catalyst coverage not integrated"]}
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
     if unresolved:

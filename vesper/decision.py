@@ -25,10 +25,16 @@ def decide(ranked, context, settings):
     reasons = []
     for name in ("score", "expected_return", "expected_excess", "uncertainty", "q05", "ask", "bid",
                  "quote_age", "bar_age", "median_dollar_volume", "bid_size", "ask_size"):
-        if name not in row or not math.isfinite(float(row[name])):
+        try:
+            valid = name in row and math.isfinite(float(row[name]))
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
             reasons.append("MISSING_OR_INVALID_" + name.upper())
     if reasons:
         return {"decision": "NO TRADE", "reasons": reasons, "winner": None, "candidate": row.ticker}
+    if min(row.ask, row.bid) <= 0:
+        return {"decision": "NO TRADE", "reasons": ["INVALID_QUOTE_PRICE"], "winner": None, "candidate": row.ticker}
     spread = (row.ask - row.bid) / ((row.ask + row.bid) / 2) * 10000
     cost = (spread + 2 * settings.slippage_bps_each_side) / 10000
     checks = {"LOW_SCORE": row.score < settings.min_score,

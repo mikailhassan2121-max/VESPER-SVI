@@ -1,26 +1,32 @@
 import asyncio
 import json
-from collections import deque
 from datetime import timedelta
 
 import pandas as pd
 
 from vesper.calendar import NY, Calendar, utcnow
+from vesper.context import dated_records, load_history
 from vesper.decision import decide, rank_predictions
-from vesper.features import build_features, normalize_bars
+from vesper.features import build_features, daily_features, normalize_bars
+from vesper.forward import forward_summary, resolve_shadow, write_result
+from vesper.market_state import enrich_candidates
 from vesper.modeling import Ensemble
 from vesper.provider import Massive, timestamp_ms
 from vesper.storage import Store
+from vesper.telegram import Telegram, signal_text
 from vesper.universe import reference_universe
 
 
 class Runtime:
-    def __init__(self, settings):
+    def __init__(self, settings, mode="LIVE"):
+        if mode not in {"LIVE", "REPLAY"}:
+            raise ValueError("Unsupported runtime mode")
+        self.mode = mode
         self.settings = settings
         settings.prepare()
         self.calendar = Calendar()
         self.provider = Massive(settings.massive_api_key.get_secret_value())
-        self.store = Store(settings.data_dir / "vesper.sqlite")
+        self.store = Store(settings.data_dir / ("vesper.sqlite" if mode == "LIVE" else "replay.sqlite"))
         self.queue = asyncio.Queue(maxsize=settings.queue_size)
         self.bars, self.quotes, self.luld = {}, {}, {}
         self.tasks = []
@@ -28,13 +34,25 @@ class Runtime:
         self.universe = {}
         self.ranked = pd.DataFrame()
         self.stop_event = asyncio.Event()
-        self.status = {"mode": "LIVE", "decision": "NO SIGNAL — SYSTEM INVALID", "failures": [],
+        self.status = {"mode": mode, "decision": "NO SIGNAL — SYSTEM INVALID", "failures": [],
                        "leaderboard": [], "production_validated": False, "universe": 0}
         self.daily = normalize_bars([], "")
         self.profiles, self.sectors = {}, {}
         self.news = None
+        self.history = None
+        self.history_day = None
+        self.context_minute = None
+        self.news_seen = {}
+        self.last_news_success = None
+        self.last_consumed = None
+        self.backfill_done = None
+        self.record_buffer = []
+        self.telegram = Telegram(settings, self.store, self.status)
+        self.eligible = set()
 
     async def start(self):
+        if self.mode != "LIVE":
+            raise ValueError("Replay does not start live workers")
         try:
             self.model = Ensemble.load(self.settings.model_dir / "production", production=True)
         except (OSError, ValueError, KeyError):
@@ -42,6 +60,12 @@ class Runtime:
         self.tasks = [asyncio.create_task(self.supervise("reference", self.reference_worker)),
                       asyncio.create_task(self.provider.stream(self.queue)),
                       asyncio.create_task(self.supervise("consumer", self.consume)),
+                      asyncio.create_task(self.supervise("news", self.news_worker)),
+                      asyncio.create_task(self.supervise("backfill", self.backfill_worker)),
+                      asyncio.create_task(self.supervise("recorder", self.recorder_worker)),
+                      asyncio.create_task(self.telegram.delivery()),
+                      asyncio.create_task(self.telegram.commands()),
+                      asyncio.create_task(self.forward_worker()),
                       asyncio.create_task(self.supervise("ranker", self.ranking_worker))]
 
     async def supervise(self, name, worker):
@@ -58,6 +82,10 @@ class Runtime:
                 self.store.event("worker_failure", {"worker": name, "error": type(exc).__name__})
                 await asyncio.sleep(10)
 
+    def worker_recovered(self, name):
+        prefix = name.upper()+"_"
+        self.status["failures"] = [code for code in self.status["failures"] if not code.startswith(prefix)]
+
     async def reference_worker(self):
         current_day = None
         while True:
@@ -65,16 +93,63 @@ class Runtime:
             if day != current_day:
                 references = await self.provider.references(day)
                 self.universe, rejected = reference_universe(references)
+                self.history = await asyncio.to_thread(load_history, self.settings.data_dir, day)
+                self.history_day = day
+                self.context_minute = None
                 self.status.update(universe=len(self.universe), rejected=rejected)
                 self.store.event("universe", {"date": str(day), "tickers": list(self.universe), "rejected": rejected})
                 current_day = day
+                self.worker_recovered("reference")
             await asyncio.sleep(60)
+
+    async def news_worker(self):
+        while True:
+            now = utcnow()
+            articles = await self.provider.news(now, now - timedelta(hours=24))
+            received = utcnow()
+            for article in articles:
+                identity = article.get("id") or article.get("article_url")
+                if identity and identity not in self.news_seen:
+                    self.news_seen[identity] = article | {"available_at": received.isoformat()}
+            self.news_seen = {key: value for key, value in self.news_seen.items()
+                              if pd.Timestamp(value["published_utc"]) >= now - timedelta(hours=24)}
+            self.news = list(self.news_seen.values())
+            self.last_news_success = received
+            self.worker_recovered("news")
+            await asyncio.sleep(60)
+
+    async def backfill_worker(self):
+        """REST warms today's missing history while the stream keeps collecting updates."""
+        while True:
+            now = utcnow()
+            session = self.calendar.session(now.astimezone(NY).date())
+            if session and session.open <= now < session.close and self.universe and self.backfill_done != session.day:
+                tickers = sorted(set(self.universe) | {"SPY", "QQQ", "IWM"})
+                async def fetch(ticker):
+                    raw = await self.provider.bars(ticker, session.day, session.day)
+                    received = utcnow()
+                    bars = normalize_bars(raw, ticker)
+                    bars = bars[(bars.end >= session.open) & (bars.end <= received)]
+                    for row in bars.to_dict("records"):
+                        row["available_at"] = pd.Timestamp(received)
+                        self.keep_bar(ticker, row, session.cutoff)
+                        self.record_market({"ev": "AM", "sym": ticker, "origin": "massive_rest",
+                            "e": int(row["end"].timestamp()*1000), "o": row["open"], "h": row["high"],
+                            "l": row["low"], "c": row["close"], "v": row["volume"], "vw": row["vwap"],
+                            "received_at": received.isoformat()})
+                for offset in range(0, len(tickers), 4):
+                    await asyncio.gather(*(fetch(ticker) for ticker in tickers[offset:offset+4]))
+                self.backfill_done = session.day
+                self.worker_recovered("backfill")
+            await asyncio.sleep(30)
 
     async def consume(self):
         while True:
             event = await self.queue.get()
             try:
                 self.ingest(event)
+                self.last_consumed = utcnow()
+                self.worker_recovered("consumer")
             finally:
                 self.queue.task_done()
 
@@ -87,67 +162,171 @@ class Runtime:
             row = {"ticker": ticker, "end": pd.Timestamp(timestamp_ms(event["e"]), unit="ms", tz="UTC"),
                    "available_at": pd.Timestamp(event["received_at"]), "open": event["o"], "high": event["h"],
                    "low": event["l"], "close": event["c"], "volume": event["v"], "vwap": event.get("vw", event["c"])}
-            self.bars.setdefault(ticker, deque(maxlen=500)).append(row)
+            event_session = self.calendar.session(row["end"].tz_convert(NY).date())
+            if event_session:
+                self.keep_bar(ticker, row, event_session.cutoff)
         elif kind == "Q":
             previous = self.quotes.get(ticker)
             if previous is None or int(event["t"]) > int(previous["t"]):
                 self.quotes[ticker] = event
         elif kind == "LULD":
-            self.luld[ticker] = event
+            previous = self.luld.get(ticker)
+            if previous is None or timestamp_ms(event["t"]) > timestamp_ms(previous["t"]):
+                self.luld[ticker] = event
         session = self.calendar.session(pd.Timestamp(event["received_at"]).tz_convert(NY).date())
-        if session and session.close - timedelta(minutes=30) <= pd.Timestamp(event["received_at"]) <= session.close:
-            self.store.event("raw_market", event)
+        received = pd.Timestamp(event["received_at"])
+        if self.mode == "LIVE" and session and session.open <= received <= session.close:
+            if kind == "AM" or received >= session.close - timedelta(minutes=30):
+                self.record_market(event)
+
+    def record_market(self, event):
+        self.record_buffer.append(event)
+        if len(self.record_buffer) >= 1000:
+            self.flush_recorder()
+            self.worker_recovered("recorder")
+
+    def flush_recorder(self):
+        if self.record_buffer:
+            self.store.events("raw_market", self.record_buffer)
+            self.record_buffer.clear()
+
+    async def recorder_worker(self):
+        while True:
+            self.flush_recorder()
+            await asyncio.sleep(1)
+
+    async def forward_worker(self):
+        while True:
+            for position in self.store.shadow_positions():
+                try:
+                    outcome = await resolve_shadow(self.provider, position, self.settings)
+                    if outcome is not None:
+                        self.store.finish_shadow(position["session"], outcome)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.status["forward_error"] = type(exc).__name__
+            completed = self.store.shadow_positions(completed=True)
+            for position in completed:
+                path = self.settings.data_dir / "results" / f"{position['session']}.json"
+                if not path.exists():
+                    write_result(path.parent, position, position["outcome"])
+            self.status["forward"] = forward_summary(completed)
+            await asyncio.sleep(60)
+
+    def keep_bar(self, ticker, row, cutoff):
+        """Preserve the last version known at cutoff and the latest later correction."""
+        bars = self.bars.setdefault(ticker, {})
+        key = row["end"]
+        versions = bars.setdefault(key, [])
+        partition = row["available_at"] <= cutoff
+        matching = [v for v in versions if (v["available_at"] <= cutoff) == partition]
+        if matching and max(v["available_at"] for v in matching) > row["available_at"]:
+            return
+        versions[:] = [v for v in versions if (v["available_at"] <= cutoff) != partition] + [row]
+        if len(bars) > 500:
+            del bars[min(bars)]
 
     async def ranking_worker(self):
         while True:
             await self.rank_once()
+            self.worker_recovered("ranker")
             await asyncio.sleep(5)
 
-    async def rank_once(self):
-        now = utcnow()
+    async def rank_once(self, now=None):
+        now = now or utcnow()
         session = self.calendar.session(now.astimezone(NY).date())
         self.status.update(updated_at=now.isoformat(), provider=self.provider.health.copy(), queue_size=self.queue.qsize(),
                            next_signal=self.calendar.upcoming(now).signal.isoformat())
+        self.status["telegram"] = self.telegram.health
         if not session or not session.open <= now < session.close:
             self.status["market"] = "CLOSED"
             return
         self.status["market"] = "OPEN"
         cutoff = min(pd.Timestamp(now) - pd.Timedelta(microseconds=1), pd.Timestamp(session.cutoff))
-        rows = [row for bars in self.bars.values() for row in bars]
+        context_key = cutoff.floor("min")
+        if self.history is not None and self.history_day == session.day and self.context_minute != context_key:
+            actions = await asyncio.to_thread(dated_records, self.settings.data_dir / "context" / "splits.json", cutoff)
+            self.daily, self.profiles = await asyncio.to_thread(self.history.inputs, session, cutoff, actions)
+            historical_features = await asyncio.to_thread(daily_features, self.daily, session.open-pd.Timedelta(microseconds=1))
+            if not historical_features.empty:
+                liquid = historical_features[historical_features.median_dollar_volume >= self.settings.min_dollar_volume]
+                self.eligible = set(liquid.ticker) & set(self.universe)
+            else:
+                self.eligible = set()
+            sectors = await asyncio.to_thread(dated_records, self.settings.data_dir / "context" / "sectors.json", cutoff)
+            self.sectors = {row["ticker"]: row["sector"] for row in sectors}
+            self.context_minute = context_key
+        window = session.signal <= now <= session.signal + timedelta(seconds=self.settings.signal_grace_seconds)
+        failures = list(self.status["failures"])
+        if self.history_day != session.day or self.daily.empty:
+            failures.append("HISTORICAL_CONTEXT_UNAVAILABLE")
+        history_coverage = len(set(self.daily.ticker) & set(self.universe)) / len(self.universe) if self.universe else 0
+        if history_coverage < self.settings.min_coverage:
+            failures.append("REFERENCE_HISTORY_COVERAGE_INCOMPLETE")
+        if not self.last_consumed or (now - self.last_consumed).total_seconds() > 60:
+            failures.append("CONSUMER_STALE")
+        if self.queue.qsize() >= self.settings.queue_size * .8:
+            failures.append("MARKET_QUEUE_BACKLOG")
+        if self.provider.health["state"] != "HEALTHY":
+            failures.append("PROVIDER_UNHEALTHY")
+        if not self.last_news_success or (now - self.last_news_success).total_seconds() > 180:
+            failures.append("NEWS_UNAVAILABLE_OR_STALE")
+        context = {"mode": self.mode, "entitlement": self.provider.health["entitlement"],
+                   "model_production": self.model is not None, "coverage": 0,
+                   "signal_window": window, "failures": failures}
+        rows = [row for bars in self.bars.values() for versions in bars.values() for row in versions]
         if not rows:
+            self.record_decision(pd.DataFrame(), context, session, cutoff)
             return
         features = await asyncio.to_thread(build_features, pd.DataFrame(rows), self.daily, self.profiles,
                                           cutoff, session.open, self.sectors, self.news)
         if features.empty:
+            self.record_decision(pd.DataFrame(), context, session, cutoff)
             return
-        covered = len(set(features.ticker) & set(self.universe))
-        coverage = covered / len(self.universe) if self.universe else 0
+        # Presence of one bar is not sufficient feature coverage.
+        required = ["return_30m", "relative_30m", "median_dollar_volume", "rvol", "sector_relative"]
+        usable = features[features[required].notna().all(axis=1)]
+        covered = len(set(usable.ticker) & self.eligible)
+        coverage = covered / len(self.eligible) if self.eligible else 0
+        self.status["eligible"] = len(self.eligible)
         self.status["coverage"] = coverage
+        context["coverage"] = coverage
         if self.model is None:
             self.status["leaderboard"] = json.loads(features.sort_values("return_30m", ascending=False).head(20).to_json(orient="records", date_format="iso"))
             self.status["leaderboard_label"] = "OBSERVED MOMENTUM — NOT MODEL RANKING"
+            self.record_decision(pd.DataFrame(), context, session, cutoff)
             return
         predictions = await asyncio.to_thread(self.model.predict, features)
-        self.ranked = rank_predictions(predictions[predictions.ticker.isin(self.universe)])
-        await self.provider.shortlist(self.ranked.head(150).ticker.to_list())
+        risk = await asyncio.to_thread(dated_records, self.settings.data_dir / "context" / "risk.json", now)
+        enriched = enrich_candidates(predictions[predictions.ticker.isin(self.eligible)], self.quotes,
+                                     self.luld, risk, now)
+        self.ranked = rank_predictions(enriched)
+        if self.mode == "LIVE":
+            await self.provider.shortlist(self.ranked.head(150).ticker.to_list())
         self.status["leaderboard"] = json.loads(self.ranked.head(20).to_json(orient="records", date_format="iso"))
         self.status["leaderboard_label"] = "MODEL RANKING"
-        window = session.signal <= now <= session.signal + timedelta(seconds=self.settings.signal_grace_seconds)
-        context = {"mode": "LIVE", "entitlement": self.provider.health["entitlement"],
-                   "model_production": True, "coverage": coverage, "signal_window": window,
-                   "failures": self.status["failures"]}
-        decision = decide(self.ranked, context, self.settings)
+        self.record_decision(self.ranked, context, session, cutoff)
+
+    def record_decision(self, ranked, context, session, cutoff):
+        decision = decide(ranked, context, self.settings)
         self.status["decision"] = decision["decision"]
-        if window:
+        self.status["decision_reasons"] = decision["reasons"]
+        if context["signal_window"]:
             payload = decision | {"session": str(session.day), "cutoff": cutoff.isoformat(),
-                                  "model": self.model.metadata.get("model_id"), "context": context,
+                                  "exit_start": (session.next_close-timedelta(minutes=10)).isoformat(),
+                                  "exit_end": (session.next_close-timedelta(minutes=2)).isoformat(),
+                                  "model": self.model.metadata.get("model_id") if self.model else None, "context": context,
                                   "ranking": self.status["leaderboard"]}
-            if self.store.signal(session.day, "LIVE", payload):
+            alert = signal_text(payload) if self.mode == "LIVE" else None
+            if self.store.signal(session.day, self.mode, payload, alert=alert, expires=session.close.isoformat()):
                 self.store.event("signal_recorded", payload)
 
     async def close(self):
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.flush_recorder()
         await self.provider.close()
+        await self.telegram.close()
         self.store.close()

@@ -35,9 +35,9 @@ Provider selection remains provisional until the user's existing subscription is
 
 These commands require a suitable subscription and substantial storage/time. Acquisition requests the reference universe on each historical date, paginates, caches raw responses, and resumes completed ticker files. It records missing outcomes explicitly. Missing delisting/merger outcomes block dataset export rather than silently removing failed securities.
 
-The compiler currently lacks point-in-time sector mappings and complete event/revision provenance. Its audit lists these deficiencies. Its output is **research-only** and does not currently pass the training validator until those inputs are reconciled. Do not replace missing sector returns with fabricated zeros to pass validation.
+The compiler accepts point-in-time sector mappings from `data/context/sectors.json` and constructs an equal-weight sector-peer benchmark. Actual mappings and complete event/revision provenance have not been supplied. Its output remains **research-only** until these inputs are reconciled. Do not replace missing sector returns with fabricated zeros to pass validation. Historical volume profiles use prior sessions of the same duration at the same elapsed time; sparse early-close history remains unavailable instead of borrowing normal-session totals.
 
-Training implements separate gap, next-day, direct-return and excess-return models; LambdaRank; binary classifiers; quantile models; purged chronological folds; out-of-fold ensemble weighting; and a locked holdout. At least 252 training, 63 validation, embargo, and 63 locked-test sessions are needed. Saved models are candidates, not silently promoted. No production promotion command exists yet.
+Training implements separate gap, next-day, direct-return and excess-return models; LambdaRank; binary classifiers; quantile models; purged chronological folds; out-of-fold ensemble weighting and sigmoid calibration; and a locked holdout. At least 252 training, 63 validation, embargo, and 63 locked-test sessions are needed. The registry reserves locked date intervals before evaluation and refuses overlapping reuse, including with changed data. Saved models are candidates, not silently promoted. No production promotion command exists yet.
 
 ## Validation
 
@@ -61,4 +61,19 @@ BUY, NO TRADE, and NO SIGNAL — SYSTEM INVALID are different outcomes. NO TRADE
 - Unresolved historical outcomes: reconcile corporate actions and symbol identity; do not drop the affected names.
 - Port already in use: stop the existing VESPER instance. SQLite and process locking prevent duplicate local instances sharing the same data directory.
 
-Telegram configuration names are reserved in `.env.example`; Telegram commands and alert delivery are not implemented in this build.
+## Telegram and paper outcomes
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` locally to enable optional delivery and commands. Only the configured chat receives replies. `/status`, `/health`, `/top`, `/signal`, `/performance`, `/why`, `/mute`, `/unmute`, `/start`, and `/help` are supported. Signal and outbox creation are atomic. Expired alerts are not sent; unknown delivery after a timeout or process interruption is not retried automatically. This avoids duplicate instructions but can require manual delivery investigation. No real delivery has been validated.
+
+BUY decisions create immutable paper records. After the following close, the worker resolves conservative execution-window benchmarks and writes `data/results/`. These are not actual fills. A benchmark entry above max-entry is flagged and still retained for unbiased forecast analysis. Missing execution windows or corporate-action data leave an unresolved outcome rather than a fabricated return.
+
+## Replay and context inputs
+
+```powershell
+.\.venv\Scripts\python.exe -m vesper export-replay --session 2026-09-04 --output data/recording.jsonl
+.\.venv\Scripts\python.exe -m vesper replay --session 2026-09-04 --recording data/recording.jsonl --output data/replay-results.jsonl
+```
+
+Use a date actually recorded by your instance. Optional `--model models/<candidate-id>` enables candidate inference during replay. Replay writes to `replay.sqlite`, never the live signal database, and does not start stream, Telegram or backfill workers. Morning aggregates and REST warmup bars are retained with receipt timestamps to reproduce partial-session startup.
+
+Optional `data/context/sectors.json`, `splits.json`, and `risk.json` are JSON arrays from an audited provider ingestion process. Every record needs `source`, timezone-aware `available_at`, `valid_from`, and exclusive `valid_until`. Sector records add `ticker` and `sector`; split records add `ticker`, `execution_date`, `split_from`, and `split_to`; risk records add `ticker`, boolean `halted`, and boolean `binary_event`. Risk evidence expires after 60 seconds. Absence of a file is missing evidence, never an all-clear. These file contracts are integration boundaries; authoritative data acquisition remains unfinished.

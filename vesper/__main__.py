@@ -22,6 +22,14 @@ def main():
     training = commands.add_parser("train")
     training.add_argument("--dataset", required=True)
     training.add_argument("--locked-start", required=True)
+    playback = commands.add_parser("replay")
+    playback.add_argument("--recording", required=True)
+    playback.add_argument("--session", type=date.fromisoformat, required=True)
+    playback.add_argument("--output", required=True)
+    playback.add_argument("--model")
+    export = commands.add_parser("export-replay")
+    export.add_argument("--session", type=date.fromisoformat, required=True)
+    export.add_argument("--output", required=True)
     args = parser.parse_args()
     settings = Settings()
     settings.prepare()
@@ -68,6 +76,12 @@ def main():
     elif args.command == "train":
         from vesper.modeling import train
         print(json.dumps(train(args.dataset, settings.model_dir, args.locked_start), indent=2))
+    elif args.command == "replay":
+        from vesper.replay import replay
+        print(json.dumps(asyncio.run(replay(settings, args.recording, args.session, args.output, args.model)), indent=2))
+    elif args.command == "export-replay":
+        from vesper.replay import export_recording
+        print(json.dumps(export_recording(settings.data_dir / "vesper.sqlite", args.session, args.output), indent=2))
     elif args.command == "build-dataset":
         from vesper.dataset import build_dataset
         print(json.dumps(build_dataset(settings.data_dir, args.output), indent=2))

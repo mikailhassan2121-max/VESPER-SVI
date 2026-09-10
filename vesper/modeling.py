@@ -6,10 +6,13 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from scipy.special import expit, logit
 from scipy.stats import spearmanr
+from sklearn.linear_model import LogisticRegression
 
 from vesper.calendar import utcnow
 from vesper.features import FEATURES
+from vesper.holdout import claim_holdout
 
 
 def purged_folds(frame, min_train=252, validation_sessions=63, embargo_sessions=1):
@@ -97,6 +100,10 @@ class Ensemble:
             out[name] = quantiles[:, i]
         for name in ("positive", "outperform", "top_decile", "top_five", "top_one"):
             out[f"p_{name}"] = values[name]
+            calibration = self.metadata.get("calibration", {}).get(name)
+            if calibration:
+                out[f"p_{name}"] = expit(calibration["slope"] * logit(np.clip(values[name], 1e-6, 1-1e-6))
+                                           + calibration["intercept"])
         out["ranking_prediction"] = values["rank"]
         out["uncertainty"] = out.q95 - out.q05 + out.disagreement
         return out
@@ -172,15 +179,42 @@ def train(dataset_path, model_dir, locked_start):
     candidate = Ensemble.fit(development)
     candidate.weight = weight
     model_id = "candidate-" + utcnow().strftime("%Y%m%dT%H%M%S%f")
+    calibration = fit_calibration(oof)
+    fingerprint = hashlib.sha256(Path(dataset_path).read_bytes()).hexdigest()
+    # Reserve before touching held-out predictions, even if this run later fails.
+    claim_holdout(model_dir, locked.session.min(), locked.session.max(), fingerprint, model_id)
+    candidate.metadata["calibration"] = calibration
+    locked_metrics = metrics(candidate.predict(locked))
     candidate.metadata = {"model_id": model_id, "status": "CANDIDATE", "trained_at": utcnow().isoformat(),
-                          "dataset_sha256": hashlib.sha256(Path(dataset_path).read_bytes()).hexdigest(),
+                          "dataset_sha256": fingerprint, "calibration": calibration,
                           "training_start": str(development.session.min()), "training_end": str(development.session.max()),
                           "locked_start": locked_start, "walkforward": metrics(oof),
-                          "locked_test": metrics(candidate.predict(locked)),
-                          "limitations": ["Probability calibration requires independent evaluation",
+                          "locked_test": locked_metrics,
+                          "limitations": ["Calibration reliability requires locked-test and forward evaluation",
                                            "Promotion requires independently audited provenance and live parity"]}
     candidate.save(Path(model_dir) / model_id)
     report = "# VESPER model validation\n\nCandidate only; no profitability claim.\n\n```json\n"
     report += json.dumps(candidate.metadata, indent=2) + "\n```\n"
     Path("MODEL_VALIDATION_REPORT.md").write_text(report, encoding="utf-8")
     return candidate.metadata
+
+
+def fit_calibration(oof):
+    """Sigmoid calibration uses predictions made without training on their labels.
+
+    Calibration-fit metrics are not acceptance evidence. Only the untouched later
+    holdout can assess the fitted calibration mapping.
+    """
+    ranks = oof.groupby("session").target_return.rank(pct=True)
+    targets = {"positive": oof.target_return > 0, "outperform": oof.target_return > oof.spy_return,
+               "top_decile": ranks >= .9, "top_five": ranks >= .95, "top_one": ranks >= .99}
+    result = {}
+    for name, y in targets.items():
+        counts = y.value_counts()
+        if len(counts) < 2 or counts.min() < 50:
+            continue
+        x = logit(np.clip(oof[f"p_{name}"].to_numpy(), 1e-6, 1-1e-6)).reshape(-1, 1)
+        fitted = LogisticRegression(C=1, random_state=17).fit(x, y.astype(int))
+        result[name] = {"slope": float(fitted.coef_[0, 0]), "intercept": float(fitted.intercept_[0]),
+                        "samples": len(y), "source": "chronological_out_of_fold"}
+    return result
