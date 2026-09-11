@@ -106,5 +106,12 @@ class Store:
         return [json.loads(row[0]) for row in self.db.execute(
             "SELECT payload FROM signals ORDER BY created DESC LIMIT ?", (limit,))]
 
+    def prune_raw(self, before, batch=5000):
+        # Signals, outcomes, and audit events are never subject to raw-feed retention.
+        with self.db:
+            result = self.db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events "
+                                     "WHERE kind='raw_market' AND created<? ORDER BY id LIMIT ?)", (before, batch))
+        return result.rowcount
+
     def close(self):
         self.db.close()

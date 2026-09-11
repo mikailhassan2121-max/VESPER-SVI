@@ -60,6 +60,7 @@ def build_dataset(directory, output):
                         continue
                     samples.append(row | targets[ticker] | {"session": folder.name, "cutoff": session.cutoff,
                         "feature_available_at": session.cutoff, "spy_return": targets["SPY"]["target_return"],
+                        "spy_cost": targets["SPY"]["cost"],
                         "sector_return": (sum(sector_returns[sectors[ticker]]) / len(sector_returns[sectors[ticker]]))
                             if ticker in sectors and sectors[ticker] in sector_returns else float("nan"),
                         "sector_benchmark": "equal_weight_point_in_time_sector_peers",

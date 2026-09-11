@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections import deque
 from datetime import timedelta
 
 import pandas as pd
@@ -8,10 +9,11 @@ from vesper.calendar import NY, Calendar, utcnow
 from vesper.context import dated_records, load_history
 from vesper.decision import decide, rank_predictions
 from vesper.features import build_features, daily_features, normalize_bars
-from vesper.forward import forward_summary, resolve_shadow, write_result
+from vesper.forward import forward_summary, performance_pause, resolve_shadow, write_result
 from vesper.market_state import enrich_candidates
-from vesper.modeling import Ensemble
 from vesper.provider import Massive, timestamp_ms
+from vesper.readiness import clock_check, feed_evidence
+from vesper.registry import load_production
 from vesper.storage import Store
 from vesper.telegram import Telegram, signal_text
 from vesper.universe import reference_universe
@@ -49,23 +51,36 @@ class Runtime:
         self.record_buffer = []
         self.telegram = Telegram(settings, self.store, self.status)
         self.eligible = set()
+        self.stream_bars, self.trades = {}, {}
+        self.market_status = None
+        self.market_status_received = None
+        self.clock_evidence = {"valid": False}
+        self.earnings_tickers = set()
+        self.earnings_received = None
+        self.monitored = set()
 
     async def start(self):
         if self.mode != "LIVE":
             raise ValueError("Replay does not start live workers")
         try:
-            self.model = Ensemble.load(self.settings.model_dir / "production", production=True)
+            self.model = load_production(self.settings.model_dir)
         except (OSError, ValueError, KeyError):
             self.status["failures"].append("PRODUCTION_MODEL_UNAVAILABLE")
+        self.status["model"] = ({"model_id": self.model.metadata.get("model_id"), "status": "PRODUCTION"}
+                                if self.model else {"status": "UNAVAILABLE"})
         self.tasks = [asyncio.create_task(self.supervise("reference", self.reference_worker)),
                       asyncio.create_task(self.provider.stream(self.queue)),
                       asyncio.create_task(self.supervise("consumer", self.consume)),
                       asyncio.create_task(self.supervise("news", self.news_worker)),
+                      asyncio.create_task(self.supervise("market_status", self.market_status_worker)),
+                      asyncio.create_task(self.supervise("earnings", self.earnings_worker)),
                       asyncio.create_task(self.supervise("backfill", self.backfill_worker)),
                       asyncio.create_task(self.supervise("recorder", self.recorder_worker)),
+                      asyncio.create_task(self.supervise("retention", self.retention_worker)),
                       asyncio.create_task(self.telegram.delivery()),
                       asyncio.create_task(self.telegram.commands()),
-                      asyncio.create_task(self.forward_worker()),
+                      asyncio.create_task(self.supervise("forward", self.forward_worker)),
+                      asyncio.create_task(self.supervise("position_monitor", self.position_monitor_worker)),
                       asyncio.create_task(self.supervise("ranker", self.ranking_worker))]
 
     async def supervise(self, name, worker):
@@ -118,6 +133,27 @@ class Runtime:
             self.worker_recovered("news")
             await asyncio.sleep(60)
 
+    async def market_status_worker(self):
+        while True:
+            start = utcnow()
+            status = await self.provider.market_status()
+            received = utcnow()
+            self.clock_evidence = clock_check(status, start, received)
+            self.market_status, self.market_status_received = status, received
+            self.worker_recovered("market_status")
+            await asyncio.sleep(30)
+
+    async def earnings_worker(self):
+        while True:
+            now = utcnow()
+            session = self.calendar.session(now.astimezone(NY).date()) or self.calendar.upcoming(now)
+            rows = await self.provider.earnings(session.day, session.next_day)
+            # Conservative whole-day exclusion includes uncertain earnings times.
+            self.earnings_tickers = {row["ticker"] for row in rows if row.get("ticker")}
+            self.earnings_received = utcnow()
+            self.worker_recovered("earnings")
+            await asyncio.sleep(60)
+
     async def backfill_worker(self):
         """REST warms today's missing history while the stream keeps collecting updates."""
         while True:
@@ -156,9 +192,13 @@ class Runtime:
     def ingest(self, event):
         kind = event.get("ev")
         ticker = event.get("sym") or event.get("T")
-        if not ticker or (ticker not in self.universe and ticker not in {"SPY", "QQQ", "IWM"}):
+        if not ticker or (ticker not in self.universe and ticker not in self.monitored and ticker not in {"SPY", "QQQ", "IWM"}):
             return
         if kind == "AM":
+            if event.get("origin") != "massive_rest":
+                recent = self.stream_bars.setdefault(ticker, deque(maxlen=5))
+                if not any(previous["e"] == event["e"] for previous in recent):
+                    recent.append(event)
             row = {"ticker": ticker, "end": pd.Timestamp(timestamp_ms(event["e"]), unit="ms", tz="UTC"),
                    "available_at": pd.Timestamp(event["received_at"]), "open": event["o"], "high": event["h"],
                    "low": event["l"], "close": event["c"], "volume": event["v"], "vwap": event.get("vw", event["c"])}
@@ -169,6 +209,10 @@ class Runtime:
             previous = self.quotes.get(ticker)
             if previous is None or int(event["t"]) > int(previous["t"]):
                 self.quotes[ticker] = event
+        elif kind == "T":
+            previous = self.trades.get(ticker)
+            if previous is None or timestamp_ms(event["t"]) > timestamp_ms(previous["t"]):
+                self.trades[ticker] = event
         elif kind == "LULD":
             previous = self.luld.get(ticker)
             if previous is None or timestamp_ms(event["t"]) > timestamp_ms(previous["t"]):
@@ -195,6 +239,14 @@ class Runtime:
             self.flush_recorder()
             await asyncio.sleep(1)
 
+    async def retention_worker(self):
+        while True:
+            before = (utcnow()-timedelta(days=self.settings.raw_retention_days)).isoformat()
+            while self.store.prune_raw(before):
+                await asyncio.sleep(.1)
+            self.worker_recovered("retention")
+            await asyncio.sleep(3600)
+
     async def forward_worker(self):
         while True:
             for position in self.store.shadow_positions():
@@ -212,7 +264,45 @@ class Runtime:
                 if not path.exists():
                     write_result(path.parent, position, position["outcome"])
             self.status["forward"] = forward_summary(completed)
+            reasons = performance_pause(self.status["forward"], self.settings.forward_pause_drawdown)
+            last_outcome = max((row["session"] for row in completed), default=None)
+            acknowledged = self.store.get_state("pause_acknowledged_through")
+            if reasons and last_outcome != acknowledged and not self.store.get_state("signal_pause"):
+                pause = {"reasons": reasons, "at": utcnow().isoformat(), "automatic": True}
+                self.store.set_state("signal_pause", pause)
+                self.store.event("signal_pause", pause)
+            self.status["pause"] = self.store.get_state("signal_pause")
+            self.worker_recovered("forward")
             await asyncio.sleep(60)
+
+    async def position_monitor_worker(self):
+        while True:
+            now = utcnow()
+            monitoring = []
+            self.monitored = set()
+            for position in self.store.shadow_positions():
+                signal = position["signal"]
+                ticker = signal["winner"]
+                self.monitored.add(ticker)
+                quote = self.quotes.get(ticker, {})
+                age = now.timestamp()-timestamp_ms(quote["t"])/1000 if quote else None
+                current = age is not None and 0 <= age <= self.settings.max_quote_age
+                risks = []
+                if not current:
+                    risks.append("CURRENT_QUOTE_UNAVAILABLE")
+                if ticker in self.earnings_tickers:
+                    risks.append("EARNINGS_CALENDAR_EVENT")
+                if 17 in self.luld.get(ticker, {}).get("i", []):
+                    risks.append("LAST_OBSERVED_LULD_HALT")
+                monitoring.append({"session": position["session"], "ticker": ticker,
+                                   "bid": quote.get("bp") if current else None,
+                                   "quote_age": age, "risks": risks, "exit_start": signal.get("exit_start"),
+                                   "exit_end": signal.get("exit_end"), "scope": "Monitoring only; original forecast unchanged"})
+            self.status["positions"] = monitoring
+            shortlist = set(self.ranked.head(150).ticker) if not self.ranked.empty else set()
+            await self.provider.shortlist(sorted(shortlist | self.monitored))
+            self.worker_recovered("position_monitor")
+            await asyncio.sleep(10)
 
     def keep_bar(self, ticker, row, cutoff):
         """Preserve the last version known at cutoff and the latest later correction."""
@@ -272,8 +362,21 @@ class Runtime:
             failures.append("PROVIDER_UNHEALTHY")
         if not self.last_news_success or (now - self.last_news_success).total_seconds() > 180:
             failures.append("NEWS_UNAVAILABLE_OR_STALE")
-        context = {"mode": self.mode, "entitlement": self.provider.health["entitlement"],
+        if not self.market_status_received or (now-self.market_status_received).total_seconds() > 60:
+            failures.append("MARKET_STATUS_STALE")
+        elif self.market_status.get("market") != "open":
+            failures.append("PROVIDER_MARKET_NOT_OPEN")
+        if not self.clock_evidence["valid"]:
+            failures.append("CLOCK_UNVERIFIED")
+        if not self.earnings_received or (now-self.earnings_received).total_seconds() > 180:
+            failures.append("EARNINGS_CALENDAR_UNAVAILABLE")
+        self.status["clock"] = self.clock_evidence
+        feed = feed_evidence(self.provider.health, self.stream_bars, self.quotes, self.eligible, now, self.settings)
+        self.status["feed_evidence"] = feed
+        self.status["pipeline_failures"] = failures
+        context = {"mode": self.mode, "entitlement": feed["entitlement"],
                    "model_production": self.model is not None, "coverage": 0,
+                   "paused": bool(self.store.get_state("signal_pause")),
                    "signal_window": window, "failures": failures}
         rows = [row for bars in self.bars.values() for versions in bars.values() for row in versions]
         if not rows:
@@ -299,11 +402,16 @@ class Runtime:
             return
         predictions = await asyncio.to_thread(self.model.predict, features)
         risk = await asyncio.to_thread(dated_records, self.settings.data_dir / "context" / "risk.json", now)
+        if self.earnings_received and 0 <= (now-self.earnings_received).total_seconds() <= 180:
+            for ticker in self.eligible & self.earnings_tickers:
+                # Absence from an earnings calendar says nothing about FDA/merger/other binary events.
+                risk.append({"ticker": ticker, "binary_event": True,
+                             "available_at": self.earnings_received.isoformat(), "source": "massive_benzinga_earnings"})
         enriched = enrich_candidates(predictions[predictions.ticker.isin(self.eligible)], self.quotes,
-                                     self.luld, risk, now)
+                                     self.luld, risk, now, trades=self.trades)
         self.ranked = rank_predictions(enriched)
         if self.mode == "LIVE":
-            await self.provider.shortlist(self.ranked.head(150).ticker.to_list())
+            await self.provider.shortlist(sorted(set(self.ranked.head(150).ticker) | self.monitored))
         self.status["leaderboard"] = json.loads(self.ranked.head(20).to_json(orient="records", date_format="iso"))
         self.status["leaderboard_label"] = "MODEL RANKING"
         self.record_decision(self.ranked, context, session, cutoff)

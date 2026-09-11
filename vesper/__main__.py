@@ -12,6 +12,10 @@ def main():
     commands.add_parser("run")
     commands.add_parser("stop")
     commands.add_parser("check")
+    pause = commands.add_parser("pause")
+    pause.add_argument("--reason", required=True)
+    resume = commands.add_parser("resume")
+    resume.add_argument("--reason", required=True)
     validate = commands.add_parser("validate-live")
     validate.add_argument("--seconds", type=int, default=120)
     historical = commands.add_parser("download")
@@ -22,6 +26,9 @@ def main():
     training = commands.add_parser("train")
     training.add_argument("--dataset", required=True)
     training.add_argument("--locked-start", required=True)
+    promotion = commands.add_parser("promote")
+    promotion.add_argument("--model-id", required=True)
+    promotion.add_argument("--audit", required=True)
     playback = commands.add_parser("replay")
     playback.add_argument("--recording", required=True)
     playback.add_argument("--session", type=date.fromisoformat, required=True)
@@ -59,6 +66,21 @@ def main():
     elif args.command == "stop":
         (settings.data_dir / "stop.request").touch()
         print("Graceful shutdown requested.")
+    elif args.command in {"pause", "resume"}:
+        from vesper.calendar import utcnow
+        from vesper.storage import Store
+        store = Store(settings.data_dir / "vesper.sqlite")
+        record = {"reasons": [args.reason], "at": utcnow().isoformat(), "automatic": False}
+        if args.command == "pause":
+            store.set_state("signal_pause", record)
+        else:
+            completed = store.shadow_positions(completed=True)
+            store.set_state("pause_acknowledged_through", max((row["session"] for row in completed), default=None))
+            store.set_state("signal_pause", None)
+        store.event("signal_"+args.command, record)
+        store.close()
+        print("New signals paused; monitoring remains active." if args.command == "pause" else
+              "Manual pause cleared and reason recorded. Data and model gates still apply.")
     elif args.command == "check":
         from vesper.calendar import Calendar, utcnow
         from vesper.storage import Store
@@ -76,6 +98,9 @@ def main():
     elif args.command == "train":
         from vesper.modeling import train
         print(json.dumps(train(args.dataset, settings.model_dir, args.locked_start), indent=2))
+    elif args.command == "promote":
+        from vesper.registry import promote
+        print(json.dumps(promote(settings.model_dir, args.model_id, args.audit), indent=2))
     elif args.command == "replay":
         from vesper.replay import replay
         print(json.dumps(asyncio.run(replay(settings, args.recording, args.session, args.output, args.model)), indent=2))

@@ -1,15 +1,13 @@
-# Engineering verification â€” 2026-09-10
+# Engineering verification — 2026-09-10
 
-- Final full suite: **54 passed, 0 failed**, 16.60 seconds on Windows / Python 3.14.
+- Final local suite: **64 passed, 0 failed**, 6.03 seconds, Windows / Python 3.14.
+- Ruff and Python compilation passed; dependency consistency check passed.
 - Two upstream Starlette/AnyIO test-client deprecation warnings remain.
-- A sandboxed run could not access pytest's temporary directory; the successful final run used the approved environment. No test failures remain.
-- Ruff static checks: passed.
-- Startup self-check: configuration, exchange calendar, SQLite passed. Credentials absent.
-- Dashboard: HTTP startup and safe missing-credential state passed via FastAPI integration test.
-- Live validator: FAIL / NOT PROVEN; missing API key; market movement pending next open session.
+- Forced child-process termination: committed SQLite decision survives, duplicate creation is refused, integrity check passes, interrupted sending becomes UNKNOWN and is not retried.
+- Browser verification: running dashboard loads its missing-key/model state, readiness reasons, empty forecast/history panels and provider status without invented market data.
+- Running-application validation: dashboard and runtime freshness pass; market closed, API key absent, no production model; **LIVE PIPELINE FAIL**. See LIVE_VALIDATION_REPORT.md.
+- Vectorized daily/intraday calculations match the previous implementation on a 100-symbol synthetic fixture. Synthetic 4,000-stock / 1,520,000-row intraday timing: **2.227 seconds**. This measures transformation time only, not full pipeline or feed latency.
 
-Coverage includes holidays, early closes, DST, point-in-time reference filtering, noncommon-stock rejection, future-data cutoff, delayed availability, duplicate bars, split/dividend math, conservative entry/exit labels, missing execution windows, purged folds, candidate model save/load and tamper detection, signal immutability and restart dedupe, stale/crossed quotes, halt/event/LULD vetoes, timestamp-unit normalization, foreign pagination rejection, and a static prohibited execution-path check.
+Regression coverage includes session calendars, cutoffs and revisions, point-in-time reference filtering, corporate actions and gross/net cost decomposition, conservative execution windows, purge/holdout reservation, calibration, artifact integrity, production evidence rejection, immutable persistence, outbox recovery, stale quotes and independent risk records, clock drift, broad stream evidence, raw retention, performance pause rules, and prevention of realized-cost ranking leakage.
 
-Continuation coverage adds matched time-of-day volume profiles, early-close separation, repeated split-context evaluation without mutation, dated context availability, signal-time invalid-state persistence, NBBO enrichment with unknown/stale risk evidence, post-cutoff correction retention, offline replay isolation, receipt-order export, overlapping holdout refusal, sigmoid calibration/class-support checks, atomic signal/outbox/shadow creation, immutable outcomes, delivery acknowledgement and ambiguous-timeout recovery. Telegram transport is mocked only in unit tests; no real phone delivery is claimed.
-
-Limitations: synthetic unit fixtures do not prove actual survivorship-bias elimination, live feature parity, full market coverage, real-world latency, strategy profitability, or process-kill recovery. Two upstream Starlette/AnyIO test-client deprecation warnings remain. The source-level prohibited-name check is a regression guard, not a formal proof of every possible network behavior.
+No real-data profitability, terminal-outcome reconciliation, all-event coverage, full-context replay parity, actual Telegram delivery, or open-session production acceptance is established. GitHub workflow results must be checked separately; local passing tests do not imply a remote CI pass.

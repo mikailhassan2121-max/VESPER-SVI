@@ -32,7 +32,8 @@ def purged_folds(frame, min_train=252, validation_sessions=63, embargo_sessions=
 def validate_dataset(frame):
     required = set(FEATURES) | {"ticker", "session", "cutoff", "feature_available_at", "label_end",
                                "entry_time", "target_return", "target_gap", "target_intraday", "spy_return",
-                               "sector_return", "cost", "pit_universe", "source"}
+                               "sector_return", "cost", "spy_cost", "target_net_return", "forecast_basis",
+                               "pit_universe", "source"}
     missing = required - set(frame)
     if missing:
         raise ValueError(f"Missing dataset fields: {sorted(missing)}")
@@ -48,8 +49,12 @@ def validate_dataset(frame):
         raise ValueError("Point-in-time universe required")
     if not frame.source.eq("massive").all():
         raise ValueError("Unsupported or synthetic dataset provenance")
-    labels = ["target_return", "target_gap", "target_intraday", "spy_return", "sector_return", "cost"]
-    if not np.isfinite(frame[labels].to_numpy()).all() or (frame.cost < 0).any():
+    if not frame.forecast_basis.eq("GROSS_RETURN_MINUS_EXECUTION_COST").all():
+        raise ValueError("Incompatible execution-cost contract")
+    if not np.allclose(frame.target_net_return, frame.target_return-frame.cost, rtol=0, atol=1e-10):
+        raise ValueError("Net label disagrees with execution costs")
+    labels = ["target_return", "target_net_return", "target_gap", "target_intraday", "spy_return", "sector_return", "cost", "spy_cost"]
+    if not np.isfinite(frame[labels].to_numpy()).all() or (frame[["cost", "spy_cost"]] < 0).any().any():
         raise ValueError("Invalid labels or costs; unresolved delistings must be reconciled")
     if (frame.groupby("session").size() < 100).any():
         raise ValueError("Cross-sectional training requires at least 100 securities per session")
@@ -71,8 +76,10 @@ class Ensemble:
                              ("intraday", "target_intraday"), ("excess", "excess")):
             y = frame.target_return - frame.spy_return if target == "excess" else frame[target]
             models[name] = lgb.LGBMRegressor(objective="huber", **params).fit(x, y).booster_
-        ranks = frame.groupby("session").target_return.rank(pct=True)
-        targets = {"positive": frame.target_return > 0, "outperform": frame.target_return > frame.spy_return,
+        net = frame.target_return-frame.get("cost", 0)
+        ranks = net.groupby(frame.session).rank(pct=True)
+        spy_net = frame.spy_return-frame.get("spy_cost", 0)
+        targets = {"positive": net > 0, "outperform": net > spy_net,
                    "top_decile": ranks >= .9, "top_five": ranks >= .95, "top_one": ranks >= .99,
                    "gap_positive": frame.target_gap > 0, "intraday_positive": frame.target_intraday > 0}
         for name, y in targets.items():
@@ -136,28 +143,45 @@ class Ensemble:
         return cls(models, metadata["weight"], metadata)
 
 
+def block_mean_ci(values, block=5, samples=2000):
+    values = np.asarray(values, dtype=float)
+    if not len(values) or not np.isfinite(values).all():
+        raise ValueError("Finite session returns required")
+    rng = np.random.default_rng(17)
+    starts = rng.integers(0, len(values), size=(samples, int(np.ceil(len(values)/block))))
+    indices = (starts[:, :, None] + np.arange(block)) % len(values)
+    means = values[indices.reshape(samples, -1)[:, :len(values)]].mean(axis=1)
+    return np.quantile(means, [.025, .975]).tolist()
+
+
 def metrics(predictions):
+    from vesper.decision import rank_predictions
     frame = predictions.copy()
-    frame["utility"] = frame.expected_excess - frame.cost - frame.uncertainty * .1
-    selected = frame.sort_values("utility", ascending=False).groupby("session").head(1).sort_values("session")
+    # Realized execution costs are labels and cannot select the historical winner.
+    ordered = rank_predictions(frame)
+    selected = ordered.groupby("session").head(1).sort_values("session")
     returns = selected.target_return - selected.cost
     wealth = (1 + returns).cumprod()
     peak = wealth.cummax().clip(lower=1)
     correlations = [spearmanr(g.ranking_prediction, g.target_return).statistic
                     for _, g in frame.groupby("session") if g.ranking_prediction.nunique() > 1]
-    top5 = frame.sort_values("utility", ascending=False).groupby("session").head(5)
+    top5 = ordered.groupby("session").head(5)
+    momentum = frame.sort_values(["return_30m", "ticker"], ascending=[False, True]).groupby("session").head(1)
+    excess = returns-selected.spy_return+selected.get("spy_cost", 0)
     return {"sessions": len(selected), "mean": float(returns.mean()), "median": float(returns.median()),
             "positive_rate": float((returns > 0).mean()),
-            "excess_vs_spy": float((returns - selected.spy_return).mean()),
+            "excess_vs_spy": float((returns - selected.spy_return + selected.get("spy_cost", 0)).mean()),
             "max_drawdown": float((wealth / peak - 1).min()),
             "rank_ic": float(np.mean(correlations)) if correlations else 0,
             "top5_mean": float((top5.target_return - top5.cost).mean()),
-            "brier": float(((frame.p_positive - (frame.target_return > 0)) ** 2).mean()),
+            "brier": float(((frame.p_positive - (frame.target_return-frame.cost > 0)) ** 2).mean()),
             "mean_ci95_normal": [float(returns.mean() - 1.96 * returns.std() / np.sqrt(len(returns))),
                                  float(returns.mean() + 1.96 * returns.std() / np.sqrt(len(returns)))],
-            "spy_mean": float(selected.spy_return.mean()),
-            "momentum_mean": float(frame.sort_values("return_30m", ascending=False).groupby("session").head(1).target_return.mean()),
-            "universe_mean": float(frame.groupby("session").target_return.mean().mean())}
+            "mean_ci95_block": block_mean_ci(returns),
+            "excess_ci95_block": block_mean_ci(excess),
+            "spy_mean": float((selected.spy_return-selected.get("spy_cost", 0)).mean()),
+            "momentum_mean": float((momentum.target_return-momentum.cost).mean()),
+            "universe_mean": float((frame.target_return-frame.cost).groupby(frame.session).mean().mean())}
 
 
 def train(dataset_path, model_dir, locked_start):
@@ -187,6 +211,7 @@ def train(dataset_path, model_dir, locked_start):
     locked_metrics = metrics(candidate.predict(locked))
     candidate.metadata = {"model_id": model_id, "status": "CANDIDATE", "trained_at": utcnow().isoformat(),
                           "dataset_sha256": fingerprint, "calibration": calibration,
+                          "forecast_basis": "GROSS_RETURN_MINUS_EXECUTION_COST",
                           "training_start": str(development.session.min()), "training_end": str(development.session.max()),
                           "locked_start": locked_start, "walkforward": metrics(oof),
                           "locked_test": locked_metrics,
@@ -205,8 +230,9 @@ def fit_calibration(oof):
     Calibration-fit metrics are not acceptance evidence. Only the untouched later
     holdout can assess the fitted calibration mapping.
     """
-    ranks = oof.groupby("session").target_return.rank(pct=True)
-    targets = {"positive": oof.target_return > 0, "outperform": oof.target_return > oof.spy_return,
+    ranks = (oof.target_return-oof.get("cost", 0)).groupby(oof.session).rank(pct=True)
+    targets = {"positive": oof.target_return-oof.get("cost", 0) > 0,
+               "outperform": oof.target_return-oof.get("cost", 0) > oof.spy_return-oof.get("spy_cost", 0),
                "top_decile": ranks >= .9, "top_five": ranks >= .95, "top_one": ranks >= .99}
     result = {}
     for name, y in targets.items():

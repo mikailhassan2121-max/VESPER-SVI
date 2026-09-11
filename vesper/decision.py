@@ -32,16 +32,23 @@ def decide(ranked, context, settings):
         if not valid:
             reasons.append("MISSING_OR_INVALID_" + name.upper())
     if reasons:
-        return {"decision": "NO TRADE", "reasons": reasons, "winner": None, "candidate": row.ticker}
+        return {"decision": "NO SIGNAL — SYSTEM INVALID", "reasons": reasons, "winner": None, "candidate": row.ticker}
     if min(row.ask, row.bid) <= 0:
-        return {"decision": "NO TRADE", "reasons": ["INVALID_QUOTE_PRICE"], "winner": None, "candidate": row.ticker}
+        return {"decision": "NO SIGNAL — SYSTEM INVALID", "reasons": ["INVALID_QUOTE_PRICE"], "winner": None, "candidate": row.ticker}
     spread = (row.ask - row.bid) / ((row.ask + row.bid) / 2) * 10000
-    cost = (spread + 2 * settings.slippage_bps_each_side) / 10000
+    half_spread = spread / 20000
+    slip = settings.slippage_bps_each_side / 10000
+    midpoint = (row.ask+row.bid)/2
+    expected_exit = midpoint*(1+row.expected_return)*(1-half_spread-slip)
+    estimated_entry = row.ask*(1+slip)
+    net_return = expected_exit/estimated_entry-1
+    cost = row.expected_return-net_return
     checks = {"LOW_SCORE": row.score < settings.min_score,
-              "NO_NET_EDGE": row.expected_return - cost <= settings.min_net_return,
+              "NO_NET_EDGE": net_return <= settings.min_net_return,
               "NO_EXCESS_EDGE": row.expected_excess - cost <= 0,
               "DOWNSIDE": row.q05 < -settings.max_downside,
-              "WIDE_OR_CROSSED_QUOTE": spread < 0 or spread > settings.max_spread_bps,
+              "CROSSED_QUOTE": spread < 0,
+              "WIDE_QUOTE": spread > settings.max_spread_bps,
               "STALE_QUOTE": not 0 <= row.quote_age <= settings.max_quote_age,
               "STALE_BAR": not 0 <= row.bar_age <= settings.max_bar_age,
               "LOW_LIQUIDITY": row.median_dollar_volume < settings.min_dollar_volume,
@@ -51,13 +58,18 @@ def decide(ranked, context, settings):
               "HALTED": not pd.isna(row.get("halted")) and bool(row.get("halted")),
               "CATALYST_STATUS_UNKNOWN": pd.isna(row.get("binary_event")),
               "BINARY_EVENT": not pd.isna(row.get("binary_event")) and bool(row.get("binary_event")),
-              "LULD_RISK": pd.isna(row.get("luld_risk")) or bool(row.get("luld_risk"))}
+              "LULD_STATUS_UNKNOWN": pd.isna(row.get("luld_risk")),
+              "LULD_RISK": not pd.isna(row.get("luld_risk")) and bool(row.get("luld_risk"))}
     reasons.extend(name for name, fails in checks.items() if fails)
     if reasons:
-        return {"decision": "NO TRADE", "reasons": reasons, "candidate": row.ticker, "winner": None}
-    max_entry = row.ask * (1 + row.expected_return - cost) / (1 + settings.min_net_return)
+        missing = {"HALT_STATUS_UNKNOWN", "CATALYST_STATUS_UNKNOWN", "LULD_STATUS_UNKNOWN",
+                   "STALE_QUOTE", "STALE_BAR", "CROSSED_QUOTE"}
+        outcome = "NO SIGNAL — SYSTEM INVALID" if missing.intersection(reasons) else "NO TRADE"
+        return {"decision": outcome, "reasons": reasons, "candidate": row.ticker, "winner": None}
+    max_entry = expected_exit / ((1+slip)*(1+settings.min_net_return))
     return {"decision": "BUY", "winner": row.ticker, "entry": float(row.ask), "max_entry": float(max_entry),
-            "expected_return": float(row.expected_return), "score": float(row.score), "reasons": []}
+            "expected_return": float(row.expected_return), "expected_net_return": float(net_return),
+            "score": float(row.score), "reasons": []}
 
 
 def rank_predictions(frame, slippage_bps=10):

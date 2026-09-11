@@ -42,3 +42,14 @@ def test_calibration_requires_class_support_and_corrects_overconfidence():
     calibrated = expit(calibration["positive"]["slope"]*logit(.9)+calibration["positive"]["intercept"])
     assert calibrated == pytest.approx(.5, abs=.02)
     assert "top_one" not in calibration
+
+def test_realized_future_costs_cannot_change_historical_ranking():
+    from vesper.modeling import metrics
+    rows=[]
+    for day in range(3):
+        for ticker, excess, cost, target, ranking in [('A', .03, .2, .1, 2), ('B', .02, 0., .01, 1)]:
+            rows.append(dict(session=str(day), ticker=ticker, expected_excess=excess, cost=cost,
+                uncertainty=.01, target_return=target, spy_return=0., spy_cost=0.,
+                ranking_prediction=ranking, p_positive=.5, return_30m=excess))
+    result=metrics(pd.DataFrame(rows))
+    assert result['mean'] == pytest.approx(-.1)

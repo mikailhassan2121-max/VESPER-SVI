@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     signal_grace_seconds: int = Field(default=30, ge=1, le=120)
     slippage_bps_each_side: float = Field(default=10, ge=0)
     queue_size: int = Field(default=20000, ge=100)
+    raw_retention_days: int = Field(default=90, ge=7)
+    forward_pause_drawdown: float = Field(default=.15, gt=0, lt=1)
 
     def prepare(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)

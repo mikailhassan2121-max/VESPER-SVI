@@ -26,6 +26,8 @@ def labels(bars, session, actions, spread_bps=20, slippage_bps=10):
     exit_end = session.next_close - timedelta(minutes=2)
     entry = executable_vwap(bars, entry_time, session.signal + timedelta(minutes=2), "entry", spread_bps, slippage_bps)
     exit_price = executable_vwap(bars, exit_start, exit_end, "exit", spread_bps, slippage_bps)
+    entry_mid = executable_vwap(bars, entry_time, session.signal + timedelta(minutes=2), "entry", 0, 0)
+    exit_mid = executable_vwap(bars, exit_start, exit_end, "exit", 0, 0)
     opening = bars[(bars.end >= session.next_open) & (bars.end < session.next_open + timedelta(minutes=2))]
     if opening.empty:
         raise ValueError("UNRESOLVED_NEXT_OPEN")
@@ -39,10 +41,12 @@ def labels(bars, session, actions, spread_bps=20, slippage_bps=10):
             if ratio != 1:
                 raise ValueError("RECONCILE_SIMULTANEOUS_SPLIT_AND_DIVIDEND")
             cash += action["cash_amount"]
+    gross = split_return(entry_mid, exit_mid, ratio, cash)
+    net = split_return(entry, exit_price, ratio, cash)
     return {"entry_time": pd.Timestamp(entry_time), "label_end": pd.Timestamp(exit_end),
             "entry_price": entry, "exit_price": exit_price, "next_open": next_open,
-            "target_return": split_return(entry, exit_price, ratio, cash),
-            "target_gap": split_return(entry, next_open, ratio, cash),
-            "target_intraday": exit_price / next_open - 1,
-            # Labels already include both sides' execution costs; never subtract them twice.
-            "cost": 0.0, "spread_bps_assumption": spread_bps, "slippage_bps_assumption": slippage_bps}
+            "target_return": gross, "target_net_return": net,
+            "target_gap": split_return(entry_mid, next_open, ratio, cash),
+            "target_intraday": (exit_mid*ratio+cash) / (next_open*ratio+cash) - 1,
+            "cost": gross-net, "forecast_basis": "GROSS_RETURN_MINUS_EXECUTION_COST",
+            "spread_bps_assumption": spread_bps, "slippage_bps_assumption": slippage_bps}

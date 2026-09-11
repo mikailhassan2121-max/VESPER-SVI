@@ -24,48 +24,54 @@ def cutoff_rows(frame, cutoff):
 
 def intraday(frame, cutoff, session_open):
     frame = cutoff_rows(frame, cutoff)
-    frame = frame[frame.end >= session_open]
-    records = []
-    for ticker, bars in frame.groupby("ticker", sort=False):
-        if bars.iloc[0].end >= pd.Timestamp(session_open) + pd.Timedelta(minutes=1):
-            # A stream started late cannot redefine the regular-session opening price.
-            continue
-        if (bars[["open", "high", "low", "close", "vwap"]] <= 0).any().any():
-            continue
-        if (bars.volume < 0).any() or (bars.high < bars.low).any() or bars.volume.sum() <= 0:
-            continue
-        last = bars.iloc[-1]
-        total_volume = bars.volume.sum()
-        vwap = (bars.vwap * bars.volume).sum() / total_volume
-        high, low = bars.high.max(), bars.low.min()
-        row = {"ticker": ticker, "price": last.close, "last_bar": last.end,
-               "return_open": last.close / bars.iloc[0].open - 1,
-               "vwap_distance": last.close / vwap - 1,
-               "range_position": (last.close - low) / (high - low) if high > low else .5,
-               "intraday_vol": np.log(bars.close).diff().std(), "volume_so_far": total_volume}
-        for minutes in (5, 15, 30, 60):
-            prior = bars[bars.end <= pd.Timestamp(cutoff) - pd.Timedelta(minutes=minutes)]
-            row[f"return_{minutes}m"] = last.close / prior.iloc[-1].close - 1 if len(prior) else np.nan
-        row["late_velocity"] = row["return_5m"] - row["return_15m"] / 3
-        recent = bars[bars.end > pd.Timestamp(cutoff) - pd.Timedelta(minutes=5)].volume.sum()
-        previous = bars[(bars.end <= pd.Timestamp(cutoff) - pd.Timedelta(minutes=5)) &
-                        (bars.end > pd.Timestamp(cutoff) - pd.Timedelta(minutes=10))].volume.sum()
-        row["volume_acceleration"] = recent / previous if previous > 0 else np.nan
-        records.append(row)
-    return pd.DataFrame(records)
+    frame = frame[frame.end >= session_open].copy()
+    if frame.empty:
+        return pd.DataFrame()
+    prices = frame[["open", "high", "low", "close", "vwap"]]
+    frame["invalid"] = (~np.isfinite(prices).all(axis=1) | (prices <= 0).any(axis=1) |
+                        ~np.isfinite(frame.volume) | (frame.volume < 0) | (frame.high < frame.low))
+    frame["weighted"] = frame.vwap*frame.volume
+    frame["log_return"] = np.log(frame.close.where(frame.close > 0)).groupby(frame.ticker).diff()
+    grouped = frame.groupby("ticker", sort=False)
+    first, last = grouped.first(), grouped.last()
+    totals = grouped.volume.sum()
+    valid = (first.end < pd.Timestamp(session_open)+pd.Timedelta(minutes=1)) & ~grouped.invalid.any() & (totals > 0)
+    out = pd.DataFrame(index=first.index)
+    out["price"], out["last_bar"] = last.close, last.end
+    out["return_open"] = last.close/first.open-1
+    out["vwap_distance"] = last.close/(grouped.weighted.sum()/totals)-1
+    high, low = grouped.high.max(), grouped.low.min()
+    out["range_position"] = ((last.close-low)/(high-low)).where(high > low, .5)
+    out["intraday_vol"] = grouped.log_return.std()
+    out["volume_so_far"] = totals
+    for minutes in (5, 15, 30, 60):
+        prior = frame[frame.end <= pd.Timestamp(cutoff)-pd.Timedelta(minutes=minutes)].groupby("ticker").close.last()
+        out[f"return_{minutes}m"] = last.close/prior-1
+    out["late_velocity"] = out.return_5m-out.return_15m/3
+    recent = frame[frame.end > pd.Timestamp(cutoff)-pd.Timedelta(minutes=5)].groupby("ticker").volume.sum()
+    previous = frame[(frame.end <= pd.Timestamp(cutoff)-pd.Timedelta(minutes=5)) &
+                     (frame.end > pd.Timestamp(cutoff)-pd.Timedelta(minutes=10))].groupby("ticker").volume.sum()
+    out["volume_acceleration"] = recent.reindex(out.index, fill_value=0)/previous.where(previous > 0)
+    return out[valid].reset_index()
 
 
 def daily_features(frame, cutoff):
-    frame = cutoff_rows(frame, cutoff)
-    records = []
-    for ticker, bars in frame.groupby("ticker"):
-        row = {"ticker": ticker}
-        for days in (1, 5, 20):
-            row[f"return_{days}d"] = bars.close.iloc[-1] / bars.close.iloc[-days-1] - 1 if len(bars) > days else np.nan
-        row["vol_20d"] = bars.close.pct_change().tail(20).std()
-        row["median_dollar_volume"] = (bars.close * bars.volume).tail(20).median() if len(bars) >= 20 else np.nan
-        records.append(row)
-    return pd.DataFrame(records)
+    frame = cutoff_rows(frame, cutoff).copy()
+    if frame.empty:
+        return pd.DataFrame()
+    grouped = frame.groupby("ticker", sort=False)
+    out = pd.DataFrame(index=grouped.size().index)
+    last = grouped.close.last()
+    for days in (1, 5, 20):
+        frame[f"lag_{days}"] = grouped.close.shift(days)
+        prior = frame.groupby("ticker").tail(1).set_index("ticker")[f"lag_{days}"]
+        out[f"return_{days}d"] = last/prior-1
+    frame["daily_return"] = grouped.close.pct_change(fill_method=None)
+    frame["dollar_volume"] = frame.close*frame.volume
+    recent = frame.groupby("ticker").tail(20).groupby("ticker")
+    out["vol_20d"] = recent.daily_return.std()
+    out["median_dollar_volume"] = recent.dollar_volume.median().where(grouped.size() >= 20)
+    return out.reset_index()
 
 
 def build_features(minutes, daily, profiles, cutoff, session_open, sectors=None, news=None):

@@ -37,6 +37,7 @@ class Massive:
                        "last_message": None, "messages": 0, "error": None}
         self.subscriptions = {"AM.*", "LULD.*"}
         self.socket = None
+        self.subscription_lock = asyncio.Lock()
 
     async def close(self):
         await self.http.aclose()
@@ -81,6 +82,16 @@ class Massive:
         return await self.pages("/v3/reference/tickers", {"market": "stocks", "locale": "us",
                                 "date": str(day), "active": "true", "limit": 1000})
 
+    async def market_status(self):
+        return await self.get("/v1/marketstatus/now")
+
+    async def earnings(self, start, end):
+        return await self.pages("/benzinga/v1/earnings", {"date.gte": str(start), "date.lte": str(end), "limit": 1000})
+
+    async def detail(self, ticker, day):
+        data = await self.get(f"/v3/reference/tickers/{quote(ticker, safe='')}", {"date": str(day)})
+        return data.get("results", {})
+
     async def bars(self, ticker, start, end, timespan="minute"):
         return await self.pages(f"/v2/aggs/ticker/{quote(ticker, safe='')}/range/1/{timespan}/{start}/{end}",
                                 {"adjusted": "false", "sort": "asc", "limit": 50000})
@@ -96,12 +107,13 @@ class Massive:
 
     async def shortlist(self, tickers):
         desired = {"AM.*", "LULD.*"} | {f"{channel}.{ticker}" for ticker in tickers for channel in ("Q", "T")}
-        old = self.subscriptions
-        self.subscriptions = desired
-        if self.socket:
-            for action, channels in (("unsubscribe", old - desired), ("subscribe", desired - old)):
-                if channels:
-                    await self.socket.send(json.dumps({"action": action, "params": ",".join(sorted(channels))}))
+        async with self.subscription_lock:
+            old = self.subscriptions
+            self.subscriptions = desired
+            if self.socket:
+                for action, channels in (("unsubscribe", old - desired), ("subscribe", desired - old)):
+                    if channels:
+                        await self.socket.send(json.dumps({"action": action, "params": ",".join(sorted(channels))}))
 
     async def stream(self, queue):
         if not self.key:
@@ -113,7 +125,6 @@ class Massive:
                 self.health.update(state="RECONNECTING", entitlement="UNAVAILABLE")
                 async with connect(self.STREAM, ping_interval=20, ping_timeout=20, max_queue=32,
                                    open_timeout=15, max_size=8_000_000) as ws:
-                    self.socket = ws
                     await ws.send(json.dumps({"action": "auth", "params": self.key}))
                     authenticated = False
                     while True:
@@ -124,8 +135,10 @@ class Massive:
                                 status = event.get("status")
                                 if status == "auth_success":
                                     authenticated = True
-                                    await ws.send(json.dumps({"action": "subscribe",
-                                                             "params": ",".join(sorted(self.subscriptions))}))
+                                    async with self.subscription_lock:
+                                        self.socket = ws
+                                        await ws.send(json.dumps({"action": "subscribe",
+                                                                 "params": ",".join(sorted(self.subscriptions))}))
                                 elif status in {"auth_failed", "error"}:
                                     raise ProviderError("Stream authentication/subscription rejected")
                                 continue
